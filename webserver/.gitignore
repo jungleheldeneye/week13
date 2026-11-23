@@ -1,0 +1,16 @@
+/webserver
+/webserver_asan
+/src/*.o
+/src/*.d
+/tests/*.o
+/tests/*.d
+/tests/test_http
+/tests/test_http_asan
+/tests/test_router
+/tests/test_router_asan
+/tests/test_config
+/tests/test_config_asan
+/tests/test_thread_pool
+/tests/test_thread_pool_asan
+*.dSYM/
+__pycache__/
