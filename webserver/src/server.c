@@ -22,6 +22,7 @@ static volatile sig_atomic_t wake_write_fd = -1;
 typedef struct {
     router routes;
     thread_pool *pool;
+    reverse_proxy proxy;
 } server_context;
 
 void server_request_stop(void)
@@ -108,6 +109,7 @@ static void handle_client(const client_job *job, void *argument)
     const char *address = inet_ntop(AF_INET, &peer->sin_addr, ip, sizeof(ip));
     http_reader reader;
     http_request request;
+    unsigned request_count = 0;
     int status;
 
     http_reader_init(&reader);
@@ -123,19 +125,28 @@ static void handle_client(const client_job *job, void *argument)
         }
         goto done;
     }
-    status = http_read_request(client_fd, &reader, &request);
-    if (thread_pool_is_stopping(context->pool)) {
-        goto done;
-    }
-    if (status == HTTP_OK) {
+    for (;;) {
+        status = http_read_request(client_fd, &reader, &request);
+        if (thread_pool_is_stopping(context->pool)) break;
+        if (status != HTTP_OK) break;
+        ++request_count;
+        if (request_count >= HTTP_MAX_REQUESTS_PER_CONNECTION) request.keep_alive = false;
         printf("HTTP 요청: %s %s %s, 본문 %zu바이트\n",
                request.method, request.target, request.version, request.body_length);
         if (router_handle(&context->routes, client_fd, &request) == -1 &&
             !thread_pool_is_stopping(context->pool)) {
             /* 이미 응답이 시작됐을 수 있으므로 추가 오류 응답은 보내지 않는다. */
             perror("HTTP 응답 처리");
+            goto done;
         }
-    } else if (status > 0) {
+        if (!request.keep_alive || thread_pool_is_stopping(context->pool)) goto done;
+        /* 연결별 reader는 유지하고, 요청별 본문/헤더 메모리는 즉시 해제한다. */
+        http_request_free(&request);
+        status = http_wait_next_request(client_fd, &reader, HTTP_KEEP_ALIVE_TIMEOUT_MS);
+        if (status != HTTP_OK || thread_pool_is_stopping(context->pool)) goto done;
+    }
+    if (thread_pool_is_stopping(context->pool)) goto done;
+    if (status > 0) {
         printf("HTTP 요청 거절: %d %s\n", status, http_status_reason(status));
         if (http_send_error(client_fd, status) == -1 &&
             !thread_pool_is_stopping(context->pool)) {
@@ -187,6 +198,7 @@ int server_run(const server_config *config)
     int wake_pipe[2] = {-1, -1};
     struct pollfd events[2];
     int result = 0;
+    int proxy_ready = 0;
 
     if (stop_requested) return 0;
     if (pipe(wake_pipe) == -1 || prepare_fd(wake_pipe[0], 1) == -1 ||
@@ -201,6 +213,14 @@ int server_run(const server_config *config)
         result = -1;
         goto done;
     }
+    if (proxy_init(&context.proxy, config) == -1) {
+        perror("프록시 초기화 실패");
+        result = -1;
+        goto done;
+    }
+    proxy_ready = 1;
+    context.routes.proxy = &context.proxy;
+    context.routes.proxy_prefix = config->proxy_prefix;
     listener = create_listener(port, &port);
     if (listener == -1) {
         perror("서버 소켓 준비 실패");
@@ -214,6 +234,7 @@ int server_run(const server_config *config)
         result = -1;
         goto done;
     }
+    context.routes.workers = context.pool;
     events[0] = (struct pollfd){.fd = listener, .events = POLLIN};
     events[1] = (struct pollfd){.fd = wake_pipe[0], .events = POLLIN};
 
@@ -222,6 +243,8 @@ int server_run(const server_config *config)
                THREAD_POOL_WORKERS, THREAD_POOL_QUEUE_CAPACITY);
         printf("서버 시작: 127.0.0.1:%u (연결 대기 중)\n", (unsigned)port);
         printf("문서 루트: %s\n", config->document_root);
+        printf("프록시: %s, 백엔드 %zu개, 무응답 제한 %ums (경로 유지)\n",
+               config->proxy_prefix, config->backend_count, config->proxy_timeout_ms);
     }
     while (!stop_requested) {
         client_job job = {0};
@@ -278,6 +301,7 @@ int server_run(const server_config *config)
 done:
     if (listener >= 0) close(listener);
     thread_pool_destroy(context.pool);
+    if (proxy_ready) proxy_destroy(&context.proxy);
     router_destroy(&context.routes);
     wake_write_fd = -1;
     if (wake_pipe[0] >= 0) close(wake_pipe[0]);

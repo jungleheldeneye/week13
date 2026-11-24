@@ -163,7 +163,7 @@ static ssize_t read_file(int fd, void *buffer, size_t capacity)
     return count;
 }
 
-int static_file_serve(int client_fd, int root_fd, const char *path)
+int static_file_serve(int client_fd, int root_fd, const char *path, bool *keep_alive)
 {
     static_file file;
     unsigned char chunk[FILE_CHUNK_BYTES];
@@ -173,7 +173,10 @@ int static_file_serve(int client_fd, int root_fd, const char *path)
     int status = static_file_open(root_fd, path, &file);
     http_response response;
 
-    if (status != 0) return http_send_error(client_fd, status);
+    if (status != 0) {
+        *keep_alive = false;
+        return http_send_error(client_fd, status);
+    }
     remaining = file.length;
     /* 첫 읽기에 실패하면 200을 보내기 전에 500으로 응답한다. */
     if (remaining > 0) {
@@ -182,10 +185,12 @@ int static_file_serve(int client_fd, int root_fd, const char *path)
         count = read_file(file.fd, chunk, amount);
         if (count <= 0) {
             static_file_close(&file);
+            *keep_alive = false;
             return http_send_error(client_fd, 500);
         }
     }
-    response = (http_response){200, file.content_type, file.length, NULL};
+    response = (http_response){.status = 200, .content_type = file.content_type,
+        .content_length = file.length, .keep_alive = *keep_alive};
     result = http_send_headers(client_fd, &response);
     while (result == 0 && remaining > 0) {
         if (count <= 0) {

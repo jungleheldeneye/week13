@@ -10,6 +10,7 @@ typedef struct {
     pthread_t thread;
     thread_pool *pool;
     int active_fd;
+    int backend_fd;
 } worker;
 
 struct thread_pool {
@@ -53,6 +54,8 @@ static void *run_worker(void *argument)
 
         pthread_mutex_lock(&pool->mutex);
         /* 종료 담당의 shutdown과 close/FD 재사용이 겹치지 않게 한다. */
+        if (self->backend_fd >= 0) close(self->backend_fd);
+        self->backend_fd = -1;
         self->active_fd = -1;
         close(job.client_fd);
         pthread_mutex_unlock(&pool->mutex);
@@ -84,6 +87,7 @@ thread_pool *thread_pool_create(size_t workers, size_t capacity,
     for (size_t i = 0; i < workers; ++i) {
         pool->workers[i].pool = pool;
         pool->workers[i].active_fd = -1;
+        pool->workers[i].backend_fd = -1;
     }
     error = pthread_mutex_init(&pool->mutex, NULL);
     if (error != 0) goto free_storage;
@@ -143,6 +147,38 @@ bool thread_pool_is_stopping(thread_pool *pool)
     return stopping;
 }
 
+int thread_pool_attach_backend(thread_pool *pool, int client_fd, int backend_fd)
+{
+    int result = -1;
+
+    pthread_mutex_lock(&pool->mutex);
+    if (!pool->stopping) {
+        for (size_t i = 0; i < pool->started; ++i) {
+            if (pool->workers[i].active_fd == client_fd && pool->workers[i].backend_fd == -1) {
+                pool->workers[i].backend_fd = backend_fd;
+                result = 0;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&pool->mutex);
+    if (result == -1) errno = ECANCELED;
+    return result;
+}
+
+void thread_pool_close_backend(thread_pool *pool, int client_fd, int backend_fd)
+{
+    pthread_mutex_lock(&pool->mutex);
+    for (size_t i = 0; i < pool->started; ++i) {
+        if (pool->workers[i].active_fd == client_fd && pool->workers[i].backend_fd == backend_fd) {
+            pool->workers[i].backend_fd = -1;
+            close(backend_fd);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pool->mutex);
+}
+
 void thread_pool_destroy(thread_pool *pool)
 {
     if (pool == NULL) return;
@@ -157,6 +193,9 @@ void thread_pool_destroy(thread_pool *pool)
         if (pool->workers[i].active_fd >= 0) {
             /* close는 워커가 맡는다. 여기서 닫으면 다른 파일의 FD로 재사용될 수 있다. */
             shutdown(pool->workers[i].active_fd, SHUT_RDWR);
+        }
+        if (pool->workers[i].backend_fd >= 0) {
+            shutdown(pool->workers[i].backend_fd, SHUT_RDWR);
         }
     }
     pthread_cond_broadcast(&pool->available);

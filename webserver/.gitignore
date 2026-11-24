@@ -12,5 +12,7 @@
 /tests/test_config_asan
 /tests/test_thread_pool
 /tests/test_thread_pool_asan
+/tests/test_proxy
+/tests/test_proxy_asan
 *.dSYM/
 __pycache__/

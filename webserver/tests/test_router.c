@@ -237,7 +237,7 @@ static void test_files_and_responses(void)
     CHECK(strncmp((char *)response, "HTTP/1.1 405 ", 13) == 0);
     CHECK(strstr((char *)response, "Allow: GET\r\n") != NULL);
     run_route(&routes, "POST", "/api/query", response, body_length + 1024);
-    CHECK(strncmp((char *)response, "HTTP/1.1 501 ", 13) == 0);
+    CHECK(strncmp((char *)response, "HTTP/1.1 503 ", 13) == 0);
     run_route(&broken, "GET", "/index.html", response, body_length + 1024);
     CHECK(strncmp((char *)response, "HTTP/1.1 500 ", 13) == 0);
 
@@ -261,6 +261,6 @@ int main(void)
     test_routes();
     test_mime();
     test_files_and_responses();
-    printf("PASS: %u route cases, MIME, safe file opening, multi-block binary transfer, empty file and 403/404/405/500/501\n", route_cases);
+    printf("PASS: %u route cases, MIME, safe file opening, multi-block binary transfer, empty file and 403/404/405/500/503\n", route_cases);
     return EXIT_SUCCESS;
 }

@@ -5,10 +5,10 @@ THREAD_FLAGS = -pthread
 
 TARGET = webserver
 HTTP_SOURCES = src/http_reader.c src/http_parser.c src/http_response.c
-CORE_SOURCES = $(HTTP_SOURCES) src/config.c src/router.c src/static_file.c src/thread_pool.c
+CORE_SOURCES = $(HTTP_SOURCES) src/config.c src/router.c src/static_file.c src/thread_pool.c src/proxy.c
 SOURCES = src/main.c src/server.c $(CORE_SOURCES)
 OBJECTS = $(SOURCES:.c=.o)
-TEST_TARGETS = tests/test_http tests/test_router tests/test_config tests/test_thread_pool
+TEST_TARGETS = tests/test_http tests/test_router tests/test_config tests/test_thread_pool tests/test_proxy
 TEST_OBJECTS = $(TEST_TARGETS:=.o)
 SANITIZER_TARGETS = $(TEST_TARGETS:=_asan)
 SANITIZER_SERVER = webserver_asan
@@ -39,14 +39,20 @@ tests/test_config: tests/test_config.o src/config.o
 tests/test_thread_pool: tests/test_thread_pool.o src/thread_pool.o
 	$(CC) $(CFLAGS) $(THREAD_FLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_proxy: tests/test_proxy.o $(CORE_SOURCES:.c=.o)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 test: $(TEST_TARGETS)
 	./tests/test_http
 	./tests/test_router
 	./tests/test_config
 	./tests/test_thread_pool
+	./tests/test_proxy
 
 integration-test: $(TARGET)
 	python3 tests/test_server.py ./$(TARGET)
+	python3 tests/test_proxy_server.py ./$(TARGET)
+	python3 tests/test_keep_alive.py ./$(TARGET)
 
 tests/test_%_asan: tests/test_%.c $(CORE_SOURCES) $(wildcard include/*.h)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -pthread -fsanitize=address,undefined \
@@ -57,6 +63,7 @@ sanitize-test: $(SANITIZER_TARGETS)
 	./tests/test_router_asan
 	./tests/test_config_asan
 	./tests/test_thread_pool_asan
+	./tests/test_proxy_asan
 
 $(SANITIZER_SERVER): $(SOURCES) $(wildcard include/*.h)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(THREAD_FLAGS) $(LDFLAGS) -fsanitize=address,undefined \
@@ -64,6 +71,8 @@ $(SANITIZER_SERVER): $(SOURCES) $(wildcard include/*.h)
 
 sanitize-integration-test: $(SANITIZER_SERVER)
 	python3 tests/test_server.py ./$(SANITIZER_SERVER)
+	python3 tests/test_proxy_server.py ./$(SANITIZER_SERVER)
+	python3 tests/test_keep_alive.py ./$(SANITIZER_SERVER)
 
 clean:
 	rm -f $(TARGET) $(SANITIZER_SERVER) $(OBJECTS) $(TEST_TARGETS) $(SANITIZER_TARGETS) $(TEST_OBJECTS) $(DEPFILES)

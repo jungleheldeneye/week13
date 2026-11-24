@@ -23,7 +23,9 @@ const char *http_status_reason(int status)
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
+    case 502: return "Bad Gateway";
     case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
     case 505: return "HTTP Version Not Supported";
     default: return "Internal Server Error";
     }
@@ -77,10 +79,11 @@ int http_send_headers(int fd, const http_response *response)
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %jd\r\n"
-        "Connection: close\r\n"
+        "Connection: %s\r\n"
         "%s\r\n",
         response->status, http_status_reason(response->status), response->content_type,
-        (intmax_t)response->content_length, allow);
+        (intmax_t)response->content_length,
+        response->keep_alive ? "keep-alive" : "close", allow);
     if (length < 0 || (size_t)length >= sizeof(header)) {
         errno = EOVERFLOW;
         return -1;

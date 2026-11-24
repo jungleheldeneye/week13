@@ -11,6 +11,8 @@
 #define HTTP_MAX_HEADERS 100
 #define HTTP_MAX_BODY_BYTES (1024 * 1024)
 #define HTTP_IDLE_TIMEOUT_MS 30000
+#define HTTP_KEEP_ALIVE_TIMEOUT_MS 5000
+#define HTTP_MAX_REQUESTS_PER_CONNECTION 100
 
 enum {
     HTTP_OK = 0,
@@ -32,6 +34,7 @@ typedef struct {
     const char *host;
     bool has_content_length;
     size_t content_length;
+    /* 파싱 시 재사용 요청 여부. 응답 처리 중 재사용할 수 없으면 false로 좁힌다. */
     bool keep_alive;
     unsigned char *body;
     size_t body_length;
@@ -49,6 +52,7 @@ typedef struct {
     const char *content_type;
     off_t content_length;
     const char *allow;
+    bool keep_alive;
 } http_response;
 
 void http_request_init(http_request *request);
@@ -65,6 +69,8 @@ int http_set_socket_timeout(int fd, unsigned milliseconds);
  * 성공한 요청은 호출자가 사용 후 해제하고, 실패 시에는 내부에서 해제한다.
  */
 int http_read_request(int fd, http_reader *reader, http_request *request);
+/* 응답 후 다음 요청의 시작만 기다린다. 유휴 만료는 응답 없이 연결을 닫는다. */
+int http_wait_next_request(int fd, const http_reader *reader, unsigned milliseconds);
 
 const char *http_status_reason(int status);
 int http_send_all(int fd, const void *buffer, size_t length);

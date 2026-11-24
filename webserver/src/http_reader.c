@@ -1,10 +1,36 @@
 #include "http.h"
 
 #include <errno.h>
+#include <poll.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
+
+int http_wait_next_request(int fd, const http_reader *reader, unsigned milliseconds)
+{
+    struct pollfd event = {.fd = fd, .events = POLLIN};
+    struct timespec now;
+    int64_t deadline;
+
+    if (reader->used != 0) return HTTP_OK;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) return HTTP_IO_ERROR;
+    deadline = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + milliseconds;
+    for (;;) {
+        int64_t remaining;
+        int ready;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) return HTTP_IO_ERROR;
+        remaining = deadline - ((int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        if (remaining <= 0) return HTTP_CONNECTION_CLOSED;
+        ready = poll(&event, 1, remaining > INT32_MAX ? INT32_MAX : (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0 || (event.revents & POLLNVAL)) return HTTP_IO_ERROR;
+        if (ready > 0) return HTTP_OK; /* EOF・shutdown도 recv를 깨워 정리한다. */
+    }
+}
 
 void http_reader_init(http_reader *reader)
 {

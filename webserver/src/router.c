@@ -8,6 +8,9 @@
 
 int router_init(router *routes, const char *document_root)
 {
+    routes->proxy_prefix = "/api";
+    routes->proxy = NULL;
+    routes->workers = NULL;
     routes->root_fd = open(document_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     return routes->root_fd == -1 ? -1 : 0;
 }
@@ -59,7 +62,7 @@ static int decode_path(const char *target, char *decoded)
     return 0;
 }
 
-int router_match(const http_request *request, http_route *route)
+static int match_prefix(const http_request *request, http_route *route, const char *prefix)
 {
     char decoded[HTTP_MAX_URI_BYTES + 1];
     size_t used = 0;
@@ -89,7 +92,8 @@ int router_match(const http_request *request, http_route *route)
     if (used == 0) route->path[used++] = '/';
     route->path[used] = '\0';
 
-    if (strcmp(route->path, "/api") == 0 || strncmp(route->path, "/api/", 5) == 0) {
+    if (strncmp(route->path, prefix, strlen(prefix)) == 0 &&
+        (route->path[strlen(prefix)] == '\0' || route->path[strlen(prefix)] == '/')) {
         route->kind = ROUTE_PROXY;
         return 0;
     }
@@ -104,18 +108,30 @@ int router_match(const http_request *request, http_route *route)
     return 0;
 }
 
-int router_handle(router *routes, int client_fd, const http_request *request)
+int router_match(const http_request *request, http_route *route)
+{
+    return match_prefix(request, route, "/api");
+}
+
+int router_handle(router *routes, int client_fd, http_request *request)
 {
     http_route route;
-    int status = router_match(request, &route);
+    int status = match_prefix(request, &route, routes->proxy_prefix != NULL ? routes->proxy_prefix : "/api");
 
-    if (status != 0) return http_send_error(client_fd, status);
+    if (status != 0) {
+        request->keep_alive = false;
+        return http_send_error(client_fd, status);
+    }
     if (route.kind == ROUTE_PROXY) {
-        /* 다음 단계에서 프록시 모듈로 전달한다. 정적 파일과 섞지 않는다. */
-        return http_send_error(client_fd, 501);
+        if (routes->proxy == NULL) {
+            request->keep_alive = false;
+            return http_send_error(client_fd, 503);
+        }
+        return proxy_serve(routes->proxy, client_fd, request, routes->workers);
     }
     if (strcmp(request->method, "GET") != 0) {
+        request->keep_alive = false;
         return http_send_error_with_allow(client_fd, 405, "GET");
     }
-    return static_file_serve(client_fd, routes->root_fd, route.path);
+    return static_file_serve(client_fd, routes->root_fd, route.path, &request->keep_alive);
 }

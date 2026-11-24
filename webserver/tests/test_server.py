@@ -91,7 +91,7 @@ def check_concurrent_requests(log, html, large):
             elif number % 3 == 1:
                 get_file("/", html, "text/html; charset=utf-8")
             else:
-                check_status(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\na\0b", 501)
+                check_status(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\na\0b", 503)
 
         # A는 아무것도 보내지 않는다. 남은 워커들이 B 이후의 요청을 처리해야 한다.
         with ThreadPoolExecutor(max_workers=12) as clients:
@@ -116,7 +116,7 @@ def check_full_queue_and_shutdown(process, log, html):
             queued.append(socket.create_connection(ADDRESS, timeout=3))
         wait_for_count(log, "작업 큐 등록:", accepted_before + workers + capacity)
 
-        queued[0].sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        queued[0].sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         queued[0].settimeout(0.1)
         try:
             queued[0].recv(1)
@@ -172,6 +172,7 @@ def stop_while_sending(process, log):
 
 
 def check_status(wire, status):
+    wire = wire.replace(b"\r\n", b"\r\nConnection: close\r\n", 1)
     response = exchange([wire])
     assert response.startswith(f"HTTP/1.1 {status} ".encode()), response
     headers, body = response.split(b"\r\n\r\n", 1)
@@ -279,10 +280,10 @@ def run():
                 b"POST /api/echo HTTP/1.1\r\nHost: localhost\r\nContent-Len",
                 b"gth: 11\r\n\r", b"\nhello", b" world",
             ])
-            assert response.startswith(b"HTTP/1.1 501 "), response
-            check_status(b"POST /api/binary HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\na\0b", 501)
-            check_status(b"POST /api/empty HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 501)
-            check_status(b"GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 501)
+            assert response.startswith(b"HTTP/1.1 503 "), response
+            check_status(b"POST /api/binary HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\na\0b", 503)
+            check_status(b"POST /api/empty HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 503)
+            check_status(b"GET /api HTTP/1.1\r\nHost: x\r\n\r\n", 503)
             response = check_status(b"POST /index.html HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 405)
             assert b"Allow: GET\r\n" in response
             check_status(b"POST / HTTP/1.1\r\nHost: x\r\n\r\n", 411)
@@ -298,7 +299,7 @@ def run():
             # 상한 크기의 본문도 작은 수신 버퍼를 거쳐 전체 보관할 수 있어야 한다.
             body = b"x" * (1024 * 1024)
             header = f"POST /api/limit HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n\r\n".encode()
-            assert exchange([header + body]).startswith(b"HTTP/1.1 501 ")
+            assert exchange([header + body]).startswith(b"HTTP/1.1 503 ")
             text = log.read_text()
             for expected in (
                 "GET /index.html?q=1 HTTP/1.1, 본문 0바이트",
