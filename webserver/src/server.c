@@ -12,9 +12,17 @@
 #include <signal.h>
 #include <stdio.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
-enum { LISTEN_BACKLOG = 128 };
+enum {
+    LISTEN_BACKLOG = 128,
+    FIRST_BYTE_CAPACITY = 128,
+    FIRST_BYTE_TIMEOUT_MS = 30000,
+    LISTENER_EVENT = 0,
+    WAKE_EVENT = 1,
+    FIRST_CLIENT_EVENT = 2
+};
 
 static volatile sig_atomic_t stop_requested = 0;
 static volatile sig_atomic_t wake_write_fd = -1;
@@ -24,6 +32,11 @@ typedef struct {
     thread_pool *pool;
     reverse_proxy proxy;
 } server_context;
+
+typedef struct {
+    client_job job;
+    int64_t expires_at;
+} waiting_client;
 
 void server_request_stop(void)
 {
@@ -190,13 +203,63 @@ static thread_pool *create_workers(server_context *context)
     return pool;
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void dispatch_client(thread_pool *pool, const client_job *job)
+{
+    int submitted = thread_pool_submit(pool, job);
+
+    if (submitted == THREAD_POOL_ACCEPTED) {
+        printf("작업 큐 등록: %u\n", (unsigned)ntohs(job->peer.sin_port));
+        return;
+    }
+    if (submitted == THREAD_POOL_FULL) {
+        http_send_unavailable(job->client_fd);
+        puts("작업 큐 가득 참: 연결 거절 (503 시도)");
+    }
+    close(job->client_fd);
+}
+
+static size_t process_waiting_clients(thread_pool *pool, struct pollfd *events,
+                                      waiting_client *clients, size_t count, int64_t now)
+{
+    size_t remaining = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        short ready = events[i].revents;
+        const client_job *job = &clients[i].job;
+
+        if (ready & (POLLERR | POLLNVAL)) {
+            close(job->client_fd);
+        } else if (ready & POLLIN) {
+            /* POLLIN can also indicate EOF. The worker makes the first recv(). */
+            dispatch_client(pool, job);
+        } else if ((ready & POLLHUP) || clients[i].expires_at <= now) {
+            close(job->client_fd);
+        } else {
+            /* Keep accept order so the first retained deadline is the earliest. */
+            events[remaining] = events[i];
+            clients[remaining++] = clients[i];
+        }
+    }
+    return remaining;
+}
+
 int server_run(const server_config *config)
 {
     server_context context = {.routes = {.root_fd = -1}, .pool = NULL};
     uint16_t port = config->port;
     int listener = -1;
     int wake_pipe[2] = {-1, -1};
-    struct pollfd events[2];
+    struct pollfd events[FIRST_CLIENT_EVENT + FIRST_BYTE_CAPACITY];
+    waiting_client clients[FIRST_BYTE_CAPACITY];
+    size_t waiting_count = 0;
     int result = 0;
     int proxy_ready = 0;
 
@@ -235,12 +298,13 @@ int server_run(const server_config *config)
         goto done;
     }
     context.routes.workers = context.pool;
-    events[0] = (struct pollfd){.fd = listener, .events = POLLIN};
-    events[1] = (struct pollfd){.fd = wake_pipe[0], .events = POLLIN};
+    events[LISTENER_EVENT] = (struct pollfd){.fd = listener, .events = POLLIN};
+    events[WAKE_EVENT] = (struct pollfd){.fd = wake_pipe[0], .events = POLLIN};
 
     if (!stop_requested) {
         printf("스레드 풀: 워커 %d개, 작업 큐 %d칸\n",
                THREAD_POOL_WORKERS, THREAD_POOL_QUEUE_CAPACITY);
+        printf("첫 요청 대기: 최대 %d개, %dms\n", FIRST_BYTE_CAPACITY, FIRST_BYTE_TIMEOUT_MS);
         printf("서버 시작: 127.0.0.1:%u (연결 대기 중)\n", (unsigned)port);
         printf("문서 루트: %s\n", config->document_root);
         printf("프록시: %s, 백엔드 %zu개, 무응답 제한 %ums (경로 유지)\n",
@@ -249,22 +313,34 @@ int server_run(const server_config *config)
     while (!stop_requested) {
         client_job job = {0};
         socklen_t peer_length = sizeof(job.peer);
-        int submitted;
+        int timeout = -1;
+        int64_t now;
 
-        /* 클라이언트 I/O는 워커가 블로킹으로 처리한다. 메인의 poll은 접속/종료 알림용이다. */
-        if (poll(events, 2, -1) == -1) {
+        if (waiting_count != 0) {
+            now = monotonic_ms();
+            if (now == -1) goto clock_failed;
+            if (clients[0].expires_at <= now) timeout = 0;
+            else timeout = (int)(clients[0].expires_at - now);
+        }
+        if (poll(events, FIRST_CLIENT_EVENT + waiting_count, timeout) == -1) {
             if (errno == EINTR) continue;
             perror("접속 대기");
             result = -1;
             break;
         }
-        if (stop_requested || events[1].revents != 0) break;
-        if (events[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        if (stop_requested || events[WAKE_EVENT].revents != 0) break;
+        if (events[LISTENER_EVENT].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             fputs("대기 소켓 오류\n", stderr);
             result = -1;
             break;
         }
-        if (!(events[0].revents & POLLIN)) continue;
+        if (waiting_count != 0) {
+            now = monotonic_ms();
+            if (now == -1) goto clock_failed;
+            waiting_count = process_waiting_clients(context.pool, events + FIRST_CLIENT_EVENT,
+                                                    clients, waiting_count, now);
+        }
+        if (stop_requested || !(events[LISTENER_EVENT].revents & POLLIN)) continue;
         job.client_fd = accept(listener, (struct sockaddr *)&job.peer, &peer_length);
         if (job.client_fd == -1) {
             if (errno == EINTR || errno == ECONNABORTED) {
@@ -280,26 +356,34 @@ int server_run(const server_config *config)
             close(job.client_fd);
             break;
         }
+        if (waiting_count == FIRST_BYTE_CAPACITY) {
+            close(job.client_fd);
+            puts("첫 요청 대기 목록 가득 참: 연결 종료");
+            continue;
+        }
         /* OS에 따라 accept가 논블로킹 속성을 상속할 수 있어 명시적으로 해제한다. */
         if (prepare_fd(job.client_fd, 0) == -1) {
             perror("클라이언트 소켓 준비");
             close(job.client_fd);
             continue;
         }
-        submitted = thread_pool_submit(context.pool, &job);
-        if (submitted == THREAD_POOL_ACCEPTED) {
-            printf("작업 큐 등록: %u\n", (unsigned)ntohs(job.peer.sin_port));
-        } else {
-            if (submitted == THREAD_POOL_FULL) {
-                http_send_unavailable(job.client_fd);
-                puts("작업 큐 가득 참: 연결 거절 (503 시도)");
-            }
+        now = monotonic_ms();
+        if (now == -1) {
             close(job.client_fd);
+            goto clock_failed;
         }
+        clients[waiting_count] = (waiting_client){.job = job, .expires_at = now + FIRST_BYTE_TIMEOUT_MS};
+        events[FIRST_CLIENT_EVENT + waiting_count] = (struct pollfd){.fd = job.client_fd, .events = POLLIN};
+        ++waiting_count;
     }
+    goto done;
 
+clock_failed:
+    perror("첫 요청 대기 시간 확인 실패");
+    result = -1;
 done:
     if (listener >= 0) close(listener);
+    for (size_t i = 0; i < waiting_count; ++i) close(clients[i].job.client_fd);
     thread_pool_destroy(context.pool);
     if (proxy_ready) proxy_destroy(&context.proxy);
     router_destroy(&context.routes);

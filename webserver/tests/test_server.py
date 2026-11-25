@@ -1,6 +1,8 @@
 """정적 파일·HTTP·스레드 풀·과부하·종료 처리의 실제 TCP 통합 테스트."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from http.client import HTTPResponse
 from pathlib import Path
 import os
 import re
@@ -15,6 +17,7 @@ import time
 
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else "./webserver").resolve()
 ADDRESS = ("127.0.0.1", 8080)
+GET_CLOSE = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
 
 
 def start_server(log, root, port=0):
@@ -81,9 +84,19 @@ def pool_limits(log):
 
 
 def check_concurrent_requests(log, html, large):
-    before = log.read_text().count("클라이언트 연결됨:")
-    with socket.create_connection(ADDRESS, timeout=3) as idle:
-        wait_for_count(log, "클라이언트 연결됨:", before + 1)
+    workers, _ = pool_limits(log)
+    with ExitStack() as clients:
+        idle = [clients.enter_context(socket.create_connection(ADDRESS, timeout=3))
+                for _ in range(workers)]
+        get_file("/", html, "text/html; charset=utf-8")
+
+        # Split a GET across the handoff and verify the first byte reaches the worker.
+        submitted = log.read_text().count("작업 큐 등록:")
+        idle[0].sendall(GET_CLOSE[:1])
+        wait_for_count(log, "작업 큐 등록:", submitted + 1)
+        idle[0].sendall(GET_CLOSE[1:])
+        response = read_response(idle[0])
+        assert response.startswith(b"HTTP/1.1 200 OK\r\n"), response
 
         def request(number):
             if number % 3 == 0:
@@ -93,10 +106,30 @@ def check_concurrent_requests(log, html, large):
             else:
                 check_status(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\na\0b", 503)
 
-        # A는 아무것도 보내지 않는다. 남은 워커들이 B 이후의 요청을 처리해야 한다.
-        with ThreadPoolExecutor(max_workers=12) as clients:
-            list(clients.map(request, range(36)))
-    print("PASS: an idle client does not block 36 concurrent HTML/binary/POST requests")
+        with ThreadPoolExecutor(max_workers=12) as concurrent:
+            list(concurrent.map(request, range(36)))
+    print(f"PASS: {workers} idle connections leave workers free, first byte preserved, 36 concurrent requests")
+
+
+def check_pending_limit_and_shutdown(process, log, html):
+    match = re.search(r"첫 요청 대기: 최대 (\d+)개", log.read_text())
+    assert match, log.read_text()
+    capacity = int(match[1])
+    with ExitStack() as clients:
+        waiting = [clients.enter_context(socket.create_connection(ADDRESS, timeout=3))
+                   for _ in range(capacity)]
+        with socket.create_connection(ADDRESS, timeout=3) as excess:
+            assert excess.recv(1) == b"", "excess idle connection was not closed"
+        waiting[0].sendall(GET_CLOSE)
+        response = read_response(waiting[0])
+        assert response.startswith(b"HTTP/1.1 200 OK\r\n"), response
+        assert response.split(b"\r\n\r\n", 1)[1] == html, response
+        get_file("/", html, "text/html; charset=utf-8")
+        process.send_signal(signal.SIGINT)
+        assert process.wait(timeout=3) == 0, log.read_text()
+        for client in waiting[1:]:
+            assert client.recv(1) == b"", "a first-byte waiter survived shutdown"
+    print(f"PASS: {capacity} first-byte waiters, excess connection closed, slot reused, immediate SIGINT")
 
 
 def check_full_queue_and_shutdown(process, log, html):
@@ -112,11 +145,12 @@ def check_full_queue_and_shutdown(process, log, html):
             # 본문용 메모리를 확보한 뒤 나머지 바이트를 기다리게 한다.
             client.sendall(b"POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\nx")
         wait_for_count(log, "클라이언트 연결됨:", started_before + workers)
-        for _ in range(capacity):
-            queued.append(socket.create_connection(ADDRESS, timeout=3))
+        for index in range(capacity):
+            client = socket.create_connection(ADDRESS, timeout=3)
+            queued.append(client)
+            client.sendall(GET_CLOSE if index == 0 else b"G")
         wait_for_count(log, "작업 큐 등록:", accepted_before + workers + capacity)
 
-        queued[0].sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         queued[0].settimeout(0.1)
         try:
             queued[0].recv(1)
@@ -128,10 +162,12 @@ def check_full_queue_and_shutdown(process, log, html):
         before = time.monotonic()
         for _ in range(8):
             with socket.create_connection(ADDRESS, timeout=3) as extra:
-                response = read_response(extra)
-                assert response.startswith(b"HTTP/1.1 503 Service Unavailable\r\n"), response
-                headers, body = response.split(b"\r\n\r\n", 1)
-                assert b"Connection: close" in headers and body == b"503 Service Unavailable\n", response
+                extra.sendall(GET_CLOSE)
+                with HTTPResponse(extra) as response:
+                    response.begin()
+                    assert response.status == 503, response.status
+                    assert response.getheader("Connection") == "close"
+                    assert response.read() == b"503 Service Unavailable\n"
         assert time.monotonic() - before < 3, "overload handling blocked the accept thread"
 
         # 한 워커가 비면 큐에서 먼저 기다리던 GET을 처리한다.
@@ -205,11 +241,8 @@ def check_cli(root):
 def stop_while_receiving(process, log, stop_signal):
     previous_connections = log.read_text().count("클라이언트 연결됨:")
     with socket.create_connection(ADDRESS, timeout=3) as idle:
-        deadline = time.monotonic() + 3
-        while log.read_text().count("클라이언트 연결됨:") <= previous_connections:
-            assert time.monotonic() < deadline, log.read_text()
-            time.sleep(0.01)
         idle.sendall(b"GET / HTTP/1.1\r\n")
+        wait_for_count(log, "클라이언트 연결됨:", previous_connections + 1)
         process.send_signal(stop_signal)
         assert process.wait(timeout=3) == 0, log.read_text()
         assert "서버 종료" in log.read_text(), log.read_text()
@@ -342,18 +375,15 @@ def run():
             log.file.close()
             (root / "private.txt").chmod(0o600)
 
-        for name, action in (("sending", stop_while_sending), ("idle", None)):
+        for name in ("sending", "idle"):
             log = ServerLog(Path(directory) / f"{name}.log")
             process = None
             try:
                 process = start_server(log, root, ADDRESS[1])
-                if action is not None:
-                    action(process, log)
+                if name == "sending":
+                    stop_while_sending(process, log)
                 else:
-                    process.send_signal(signal.SIGINT)
-                    assert process.wait(timeout=3) == 0, log.read_text()
-                    assert "서버 종료" in log.read_text(), log.read_text()
-                    print("PASS: SIGINT wakes an idle accept thread and sleeping workers")
+                    check_pending_limit_and_shutdown(process, log, html)
             finally:
                 if process is not None and process.poll() is None:
                     process.kill()

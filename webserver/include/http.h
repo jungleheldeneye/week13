@@ -77,7 +77,7 @@ int http_send_all(int fd, const void *buffer, size_t length);
 int http_send_headers(int fd, const http_response *response);
 int http_send_error(int fd, int status);
 int http_send_error_with_allow(int fd, int status, const char *allow);
-/* 큐가 찼을 때 대기 없이 503을 시도한다. fd를 논블로킹으로 바꾸며 호출자가 닫는다. */
+/* 거절할 fd에서 이미 도착한 바이트 일부를 논블로킹으로 폐기하고 503을 시도한다. 호출자가 닫는다. */
 int http_send_unavailable(int fd);
 
 #endif

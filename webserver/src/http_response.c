@@ -119,8 +119,11 @@ int http_send_error(int fd, int status)
 
 int http_send_unavailable(int fd)
 {
+    unsigned char discarded[HTTP_MAX_HEADER_BYTES];
     int flags = fcntl(fd, F_GETFL);
 
     if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) return -1;
+    /* 읽지 않은 데이터가 남은 소켓을 닫으면 TCP reset으로 503이 잘릴 수 있다. */
+    (void)recv(fd, discarded, sizeof(discarded), 0);
     return http_send_error(fd, 503);
 }
