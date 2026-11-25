@@ -1,0 +1,9 @@
+server
+server_asan
+test_runner
+*.dSYM/
+server_tsan
+bench
+bench_result.md
+.DS_Store
+dist/
