@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>POST 테스트</title><link rel="stylesheet" href="/css/style.css"></head>
+<body>
+  <h1>POST 본문 테스트</h1>
+  <p>입력하고 보내면 서버의 <code>/echo</code>가 받은 본문을 그대로 돌려줘요.</p>
+  <form method="post" action="/echo">
+    <p><label>이름 <input name="name" value="혁"></label></p>
+    <p><label>메시지 <textarea name="msg" rows="3">안녕 서버! a+b=c & 100%</textarea></label></p>
+    <button type="submit">보내기</button>
+  </form>
+  <p><a href="/">처음으로</a></p>
+</body>
+</html>
