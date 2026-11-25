@@ -7,16 +7,31 @@
 ## 1. 흐름도
 
 ```mermaid
-flowchart TD
-    C["클라이언트"] -->|"TCP 연결"| M["메인 스레드<br/>논블로킹 accept() · poll()<br/>첫 요청 대기 최대 128개 · 5초"]
-    M -->|"읽기 가능 (POLLIN)"| Q[("FIFO 작업 큐 · 최대 64개")]
-    Q --> W["pthread 워커 4개<br/>첫 recv()부터 블로킹 I/O"]
-    W --> P["HTTP 파싱<br/>GET·POST · 헤더 · Content-Length 본문"]
-    P --> R{"라우팅"}
-    R -->|"기본 /api 및 /api/*"| X["리버스 프록시<br/>요청마다 Round-Robin으로 한 곳 선택"]
-    R -->|"그 외 GET"| S["C 서버 내부에서 정적 파일 읽기<br/>openat() · 최대 16KiB 단위 전송"]
-    X --> A["백엔드 A · 8001"]
-    X --> B["백엔드 B · 8002"]
+flowchart LR
+    C["클라이언트"] -->|"TCP"| S
+
+    subgraph S["C 서버"]
+        direction TB
+        M["메인이 poll()로 연결 감시<br/>최대 128개 · 첫 바이트 대기 5초"]
+        W["첫 바이트 도착 → 워커 배정"]
+        R["워커가 요청을 읽고 경로 확인<br/>정적 GET은 파일을 직접 읽어 응답"]
+        M -->|"FIFO 큐 · 최대 64개"| W
+        W --> R
+    end
+
+    S -->|"/api 요청"| B
+
+    subgraph B["라운드 로빈 · 요청마다 한 곳 선택"]
+        direction TB
+        A["백엔드 A · 8001"]
+        B2["백엔드 B · 8002"]
+        A ~~~ B2
+    end
+
+    classDef focus fill:#d3ee91,stroke:#627744,color:#192110
+    class W focus
+    style S fill:transparent,stroke:#888
+    style B fill:transparent,stroke:#888
 ```
 
 **요청 하나가 거치는 세 단계**
