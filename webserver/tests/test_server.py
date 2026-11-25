@@ -111,6 +111,27 @@ def check_concurrent_requests(log, html, large):
     print(f"PASS: {workers} idle connections leave workers free, first byte preserved, 36 concurrent requests")
 
 
+def check_first_byte_timeout(log, html):
+    match = re.search(r"첫 요청 대기: 최대 \d+개, (\d+)ms", log.read_text())
+    assert match, log.read_text()
+    limit = int(match[1]) / 1000
+    opened = time.monotonic()
+    with socket.create_connection(ADDRESS, timeout=limit + 3) as silent, \
+            socket.create_connection(ADDRESS, timeout=limit + 3) as late:
+        # 같은 시각에 연결해도 제한 시간 안에 요청을 시작하면 정상 처리한다.
+        time.sleep(limit * 0.6)
+        late.sendall(GET_CLOSE)
+        response = read_response(late)
+        assert response.startswith(b"HTTP/1.1 200 OK\r\n"), response
+        assert response.split(b"\r\n\r\n", 1)[1] == html, response
+        # 아무것도 보내지 않은 연결은 응답 없이 제한 시간 무렵 닫힌다.
+        assert silent.recv(1) == b"", "silent connection received data"
+        elapsed = time.monotonic() - opened
+        assert limit * 0.9 <= elapsed <= limit + 2, f"closed after {elapsed:.2f}s, limit {limit}s"
+    print(f"PASS: silent connection closed after {elapsed:.1f}s ({limit:g}s first-byte limit), "
+          f"request started within the limit served")
+
+
 def check_pending_limit_and_shutdown(process, log, html):
     match = re.search(r"첫 요청 대기: 최대 (\d+)개", log.read_text())
     assert match, log.read_text()
@@ -355,6 +376,7 @@ def run():
             assert duplicate.returncode == 1, duplicate
             print("PASS: static HTML/CSS/JS/images, 4MiB binary transfer, path security, CLI, HTTP errors, POST bodies, disconnect")
             check_concurrent_requests(log, html, large)
+            check_first_byte_timeout(log, html)
             check_full_queue_and_shutdown(process, log, html)
         finally:
             if process is not None and process.poll() is None:
