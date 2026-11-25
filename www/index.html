@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>My C Web Server</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <h1>My C Web Server</h1>
+  <p>C로 직접 만든 웹 서버가 이 페이지와 CSS, JS, 이미지를 보내고 있어요.</p>
+  <img src="/img/logo.svg" alt="로고" width="120">
+  <p id="js-check">JavaScript 로딩 확인 중...</p>
+  <ul>
+    <li><a href="/docs/">하위 폴더 (docs/index.html)</a></li>
+    <li><a href="/docs">'/' 없는 폴더 주소 → 301 이동</a></li>
+    <li><a href="/없는파일.html">없는 파일 → 404</a></li>
+    <li><a href="/form.html">POST 폼 → /echo</a></li>
+    <li><a href="/cgi.html">CGI 데모 (스크립트 실행)</a></li>
+  </ul>
+  <script src="/js/app.js"></script>
+</body>
+</html>
